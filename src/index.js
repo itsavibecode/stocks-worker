@@ -150,6 +150,40 @@ async function handleConnectUrl(request, env, uid, cors) {
   return jsonResponse({ redirectURI: r.data.redirectURI || r.data.redirectUri || r.data }, 200, cors);
 }
 
+async function handleTransactions(request, env, uid, cors) {
+  const body = await request.json().catch(() => ({}));
+  const { snaptradeUserId, snaptradeUserSecret, startDate, endDate } = body;
+  if (!snaptradeUserId || !snaptradeUserSecret) {
+    return jsonResponse({ error: 'snaptradeUserId and snaptradeUserSecret required' }, 400, cors);
+  }
+  if (snaptradeUserId !== uid) {
+    return jsonResponse({ error: 'snaptradeUserId must match the authenticated Firebase UID' }, 403, cors);
+  }
+
+  // Default window: last 90 days
+  const today = new Date();
+  const past = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+  const start = startDate || past.toISOString().slice(0, 10);
+  const end = endDate || today.toISOString().slice(0, 10);
+
+  // SnapTrade exposes activities at /activities — accepts userId/userSecret + date range.
+  // No accountId filter needed; returns activities across all the user's connected accounts.
+  const r = await snaptradeFetch(env, {
+    method: 'GET',
+    path: '/activities',
+    query: {
+      userId: snaptradeUserId,
+      userSecret: snaptradeUserSecret,
+      startDate: start,
+      endDate: end,
+    },
+  });
+  if (!r.ok) {
+    return jsonResponse({ error: 'SnapTrade /activities failed', detail: r.error }, r.status || 502, cors);
+  }
+  return jsonResponse({ activities: r.data || [], window: { startDate: start, endDate: end } }, 200, cors);
+}
+
 async function handleAccounts(request, env, uid, cors) {
   const body = await request.json().catch(() => ({}));
   const { snaptradeUserId, snaptradeUserSecret } = body;
@@ -229,6 +263,9 @@ export default {
       }
       if (url.pathname === '/accounts' && request.method === 'POST') {
         return await handleAccounts(request, env, uid, cors);
+      }
+      if (url.pathname === '/transactions' && request.method === 'POST') {
+        return await handleTransactions(request, env, uid, cors);
       }
       return jsonResponse({ error: 'Not found' }, 404, cors);
     } catch (e) {

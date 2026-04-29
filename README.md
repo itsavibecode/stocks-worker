@@ -11,6 +11,7 @@ All endpoints require `Authorization: Bearer <Firebase ID token>` header.
 | `POST` | `/register` | — | `{ snaptradeUserId, snaptradeUserSecret }` |
 | `POST` | `/connect-url` | `{ snaptradeUserId, snaptradeUserSecret, immediateRedirect?: boolean }` | `{ redirectURI }` |
 | `POST` | `/accounts` | `{ snaptradeUserId, snaptradeUserSecret }` | `{ accounts: [...with positions inline] }` |
+| `POST` | `/transactions` | `{ snaptradeUserId, snaptradeUserSecret, startDate?, endDate? }` | `{ activities: [...], window: {startDate, endDate} }` |
 | `GET` | `/health` | — | `{ ok: true, ts }` |
 
 `snaptradeUserId` is always the user's Firebase UID. `snaptradeUserSecret` is opaque — the browser receives it from `/register` and stores it in its own Firestore portfolio doc, then sends it back on every subsequent call.
