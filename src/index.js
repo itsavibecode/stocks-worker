@@ -1,13 +1,23 @@
-// stocks-worker — Cloudflare Worker proxying SnapTrade API calls behind Firebase auth.
+// stocks-worker — Cloudflare Worker proxying SnapTrade API calls behind Firebase auth,
+// plus a daily cron that sends dividend ex-date / pay-date reminder emails via Resend.
 //
 // Browser → Worker: `Authorization: Bearer <Firebase ID token>` on every request.
 // Worker verifies token via Firebase's JWKS, then signs the upstream SnapTrade
 // request with HMAC-SHA256(consumerKey) per SnapTrade's auth spec.
+//
+// Cron → Worker: scheduled handler runs once daily, reads OWNER_UID's portfolio doc
+// from Firestore (via service account), pulls fresh dividend dates from Finnhub,
+// and emails any new reminders via Resend.
 
 import { jwtVerify, createRemoteJWKSet } from 'jose';
 
 // SnapTrade endpoints
 const SNAPTRADE_BASE = 'https://api.snaptrade.com/api/v1';
+// Firestore + Identity Toolkit base URLs
+const FIRESTORE_BASE = 'https://firestore.googleapis.com/v1';
+const IDENTITY_BASE = 'https://identitytoolkit.googleapis.com/v1';
+const FINNHUB_BASE = 'https://finnhub.io/api/v1';
+const RESEND_BASE = 'https://api.resend.com';
 
 // Firebase token verification — JWKs cached automatically by jose.
 let JWKS = null;
@@ -267,10 +277,423 @@ export default {
       if (url.pathname === '/transactions' && request.method === 'POST') {
         return await handleTransactions(request, env, uid, cors);
       }
+      // Manual cron trigger — useful for testing without waiting for the schedule.
+      // Auth: must be signed in as OWNER_UID (single-user model). Body optional.
+      if (url.pathname === '/run-reminders' && request.method === 'POST') {
+        if (uid !== env.OWNER_UID) {
+          return jsonResponse({ error: 'Manual reminder trigger restricted to OWNER_UID' }, 403, cors);
+        }
+        const result = await runDailyReminders(env);
+        return jsonResponse(result, 200, cors);
+      }
       return jsonResponse({ error: 'Not found' }, 404, cors);
     } catch (e) {
       console.error('Handler error:', e);
       return jsonResponse({ error: 'Internal error', detail: String(e.message || e) }, 500, cors);
     }
   },
+
+  // Scheduled (cron) handler — runs daily at the time configured in wrangler.toml's
+  // [triggers] crons. Single user (OWNER_UID); see runDailyReminders for the logic.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      runDailyReminders(env).catch((err) => {
+        console.error('Cron run failed:', err);
+      })
+    );
+  },
 };
+
+// ═════════════════════════════════════════════════════════════════════
+// SERVICE ACCOUNT AUTH (Google OAuth2 JWT exchange) — used to call
+// Firestore REST and Identity Toolkit on behalf of the project.
+// ═════════════════════════════════════════════════════════════════════
+
+let _accessTokenCache = null; // { token, expiresAt }
+
+async function getServiceAccountToken(env) {
+  if (_accessTokenCache && _accessTokenCache.expiresAt > Date.now() + 60_000) {
+    return _accessTokenCache.token;
+  }
+
+  const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/datastore https://www.googleapis.com/auth/identitytoolkit',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now,
+  };
+
+  const enc = new TextEncoder();
+  const headerB64 = b64url(btoa(JSON.stringify({ alg: 'RS256', typ: 'JWT' })));
+  const claimB64 = b64url(btoa(JSON.stringify(claim)));
+  const unsigned = `${headerB64}.${claimB64}`;
+
+  const privateKey = await pemToCryptoKey(sa.private_key);
+  const sigBuf = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', privateKey, enc.encode(unsigned));
+  const sigB64 = b64url(arrayBufferToBase64(sigBuf));
+
+  const jwt = `${unsigned}.${sigB64}`;
+
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    throw new Error(`Service account token exchange failed: ${resp.status} ${errTxt}`);
+  }
+  const data = await resp.json();
+  _accessTokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in - 120) * 1000,
+  };
+  return data.access_token;
+}
+
+function b64url(b64) {
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+async function pemToCryptoKey(pem) {
+  // Strip PEM header/footer + whitespace, base64-decode, import as PKCS#8.
+  const stripped = pem
+    .replace('-----BEGIN PRIVATE KEY-----', '')
+    .replace('-----END PRIVATE KEY-----', '')
+    .replace(/\s/g, '');
+  const der = Uint8Array.from(atob(stripped), (c) => c.charCodeAt(0));
+  return crypto.subtle.importKey(
+    'pkcs8',
+    der.buffer,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// FIRESTORE REST helpers — translate to/from Firestore's typed-value
+// JSON format and provide minimal get/patch over documents.
+// ═════════════════════════════════════════════════════════════════════
+
+async function firestoreGetDoc(env, accessToken, path) {
+  const url = `${FIRESTORE_BASE}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${path}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (resp.status === 404) return null;
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    throw new Error(`Firestore GET ${path} failed: ${resp.status} ${errTxt}`);
+  }
+  return resp.json();
+}
+
+// PATCH with field-path mask — only the specified field paths get touched, leaving
+// other fields in the doc intact. Avoids racing with browser-side prefs writes.
+async function firestorePatchFields(env, accessToken, path, fieldPathsToValues) {
+  // fieldPathsToValues: { "prefs.notifiedReminders": <jsValue> }
+  // Build update mask + reconstruct the nested fields shape that Firestore expects.
+  const fields = {};
+  const masks = [];
+  for (const [fp, value] of Object.entries(fieldPathsToValues)) {
+    masks.push(fp);
+    setNestedFsValue(fields, fp.split('.'), value);
+  }
+  const mask = masks.map((m) => `updateMask.fieldPaths=${encodeURIComponent(m)}`).join('&');
+  const url = `${FIRESTORE_BASE}/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/${path}?${mask}`;
+  const resp = await fetch(url, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields }),
+  });
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    throw new Error(`Firestore PATCH ${path} failed: ${resp.status} ${errTxt}`);
+  }
+  return resp.json();
+}
+
+function setNestedFsValue(target, parts, jsValue) {
+  // Walk the path and build nested mapValue wrappers. Final part gets the typed value.
+  if (parts.length === 1) {
+    target[parts[0]] = jsToFsValue(jsValue);
+    return;
+  }
+  if (!target[parts[0]]) target[parts[0]] = { mapValue: { fields: {} } };
+  setNestedFsValue(target[parts[0]].mapValue.fields, parts.slice(1), jsValue);
+}
+
+function fsValueToJs(v) {
+  if (!v) return undefined;
+  if ('stringValue' in v) return v.stringValue;
+  if ('integerValue' in v) return parseInt(v.integerValue, 10);
+  if ('doubleValue' in v) return v.doubleValue;
+  if ('booleanValue' in v) return v.booleanValue;
+  if ('nullValue' in v) return null;
+  if ('timestampValue' in v) return v.timestampValue;
+  if ('arrayValue' in v) {
+    return (v.arrayValue.values || []).map(fsValueToJs);
+  }
+  if ('mapValue' in v) {
+    const out = {};
+    for (const [k, val] of Object.entries(v.mapValue.fields || {})) out[k] = fsValueToJs(val);
+    return out;
+  }
+  return undefined;
+}
+
+function jsToFsValue(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === 'string') return { stringValue: v };
+  if (typeof v === 'boolean') return { booleanValue: v };
+  if (typeof v === 'number') {
+    if (Number.isInteger(v)) return { integerValue: String(v) };
+    return { doubleValue: v };
+  }
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(jsToFsValue) } };
+  if (typeof v === 'object') {
+    const fields = {};
+    for (const [k, val] of Object.entries(v)) fields[k] = jsToFsValue(val);
+    return { mapValue: { fields } };
+  }
+  return { nullValue: null };
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// IDENTITY TOOLKIT — look up a user's email by Firebase UID.
+// ═════════════════════════════════════════════════════════════════════
+
+async function getUserEmail(env, accessToken, uid) {
+  const url = `${IDENTITY_BASE}/projects/${env.FIREBASE_PROJECT_ID}/accounts:lookup`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ localId: [uid] }),
+  });
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    throw new Error(`Identity Toolkit lookup failed: ${resp.status} ${errTxt}`);
+  }
+  const data = await resp.json();
+  return data.users && data.users[0] && data.users[0].email;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// FINNHUB — re-pull dividend dates per ticker on each cron run. The
+// browser doesn't sync DV (per-ticker dividend metadata) to Firestore
+// for built-in tickers, so the worker has to fetch its own copy.
+// ═════════════════════════════════════════════════════════════════════
+
+async function fetchDividendData(finnhubKey, ticker, fromDate, toDate) {
+  const url = `${FINNHUB_BASE}/stock/dividend?symbol=${encodeURIComponent(ticker)}&from=${fromDate}&to=${toDate}&token=${finnhubKey}`;
+  const resp = await fetch(url);
+  if (!resp.ok) return [];
+  const data = await resp.json();
+  return Array.isArray(data) ? data : [];
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// RESEND — send a single rolled-up reminder email per cron run.
+// ═════════════════════════════════════════════════════════════════════
+
+async function sendReminderEmail(env, { to, subject, html, text }) {
+  const resp = await fetch(`${RESEND_BASE}/emails`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: env.SENDER_FROM, to, subject, html, text }),
+  });
+  if (!resp.ok) {
+    const errTxt = await resp.text();
+    throw new Error(`Resend send failed: ${resp.status} ${errTxt}`);
+  }
+  return resp.json();
+}
+
+function buildReminderEmail(reminders) {
+  reminders.sort((a, b) => {
+    if (a.daysToEvent !== b.daysToEvent) return a.daysToEvent - b.daysToEvent;
+    return a.ticker.localeCompare(b.ticker);
+  });
+  const subject = `📊 Stockfolio: ${reminders.length} dividend reminder${reminders.length !== 1 ? 's' : ''}`;
+  const text = reminders
+    .map((r) => {
+      const when = r.daysToEvent === 0 ? 'today' : `in ${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}`;
+      if (r.type === 'ex') {
+        return `• ${r.ticker} ex-date ${when} (${r.date}) — buy by today to receive next dividend`;
+      }
+      const total = (r.amount || 0) * (r.totalShares || 0);
+      return `• ${r.ticker} pay-date ${when} (${r.date}) — $${total.toFixed(2)} incoming (${r.totalShares} sh × $${r.amount}/sh)`;
+    })
+    .join('\n');
+  const html = `
+<html><body style="font-family:system-ui,-apple-system,sans-serif;background:#0d1420;color:#dfe6f0;padding:20px;max-width:600px;margin:0 auto">
+  <h2 style="color:#4e8cff;margin:0 0 16px">📊 Stockfolio Daily Reminder</h2>
+  <p style="color:#c1ccdd">${reminders.length} upcoming dividend event${reminders.length !== 1 ? 's' : ''} to flag:</p>
+  ${reminders
+    .map((r) => {
+      const when =
+        r.daysToEvent === 0
+          ? '<strong>today</strong>'
+          : `in <strong>${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}</strong>`;
+      const tagColor = r.type === 'ex' ? '#fbbf24' : '#34d399';
+      const tagText = r.type === 'ex' ? 'EX-DATE' : 'PAY-DATE';
+      let detail;
+      if (r.type === 'ex') {
+        detail = 'Buy by end of today to receive next dividend';
+      } else {
+        const total = (r.amount || 0) * (r.totalShares || 0);
+        detail = `<strong style="color:#34d399">$${total.toFixed(2)}</strong> incoming · ${r.totalShares} shares × $${r.amount}/sh`;
+      }
+      return `
+    <div style="background:#131c2e;border:1px solid #1a2540;border-radius:8px;padding:12px 16px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:#dfe6f0">${r.ticker}</span>
+        <span style="background:${tagColor}33;color:${tagColor};font-size:10px;font-weight:700;padding:3px 9px;border-radius:4px;letter-spacing:.5px">${tagText}</span>
+      </div>
+      <div style="font-size:13px;color:#c1ccdd">${when} (${r.date})</div>
+      <div style="font-size:13px;color:#c1ccdd;margin-top:4px">${detail}</div>
+    </div>`;
+    })
+    .join('')}
+  <p style="color:#5a6e8a;font-size:11px;margin-top:24px;border-top:1px solid #1a2540;padding-top:12px">
+    From your Portfolio Command Center · <a href="https://itsavibecode.github.io/stocks/" style="color:#4e8cff">Open app</a> · Manage in Settings → Dividend Reminders
+  </p>
+</body></html>`;
+  return { subject, html, text };
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// CRON HANDLER — read user portfolio, compute upcoming reminders,
+// send a single rolled-up email per run, dedupe via prefs.notifiedReminders.
+// ═════════════════════════════════════════════════════════════════════
+
+async function runDailyReminders(env) {
+  const uid = env.OWNER_UID;
+  if (!uid) {
+    return { ok: false, reason: 'OWNER_UID env var not set' };
+  }
+  const accessToken = await getServiceAccountToken(env);
+  const doc = await firestoreGetDoc(env, accessToken, `portfolios/${uid}`);
+  if (!doc || !doc.fields) {
+    return { ok: false, reason: 'Portfolio doc not found for OWNER_UID' };
+  }
+
+  const tks = fsValueToJs(doc.fields.tickers) || [];
+  const lots = fsValueToJs(doc.fields.lots) || {};
+  const prefs = fsValueToJs(doc.fields.prefs) || {};
+
+  if (!prefs.remEnabled) return { ok: true, reason: 'Reminders disabled by user', sent: 0 };
+  const finnhubKey = prefs.finnhubKey;
+  if (!finnhubKey) return { ok: false, reason: 'No Finnhub key in user prefs' };
+
+  const userEmail = await getUserEmail(env, accessToken, uid);
+  if (!userEmail) return { ok: false, reason: 'Could not look up user email from Firebase Auth' };
+
+  const daysEx = prefs.remDaysEx == null ? 1 : Number(prefs.remDaysEx);
+  const daysPay = prefs.remDaysPay == null ? 1 : Number(prefs.remDaysPay);
+  const optOut = prefs.remOptOut || {};
+  const notified = { ...(prefs.notifiedReminders || {}) };
+
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0); // Compare as UTC midnight
+
+  const sharesByTicker = {};
+  tks.forEach((t) => {
+    const ts = lots[t] || [];
+    sharesByTicker[t] = ts.reduce((s, lot) => s + (Number(lot.s) || 0), 0);
+  });
+  const tickersToCheck = tks.filter((t) => !optOut[t] && sharesByTicker[t] > 0);
+
+  const fromStr = isoDate(new Date(today.getTime() - 7 * 86400000));
+  const toStr = isoDate(new Date(today.getTime() + 30 * 86400000));
+
+  const reminders = [];
+  const errors = [];
+  for (const ticker of tickersToCheck) {
+    let divData;
+    try {
+      divData = await fetchDividendData(finnhubKey, ticker, fromStr, toStr);
+    } catch (e) {
+      errors.push({ ticker, error: String(e.message || e) });
+      continue;
+    }
+    for (const dv of divData) {
+      const totalShares = sharesByTicker[ticker];
+      // Ex-date check
+      const exStr = dv.exDividendDate || dv.exDate;
+      if (exStr) {
+        const exMs = Date.parse(exStr + 'T12:00:00Z');
+        if (!isNaN(exMs)) {
+          const daysToEx = Math.ceil((exMs - today.getTime()) / 86400000);
+          if (daysToEx >= 0 && daysToEx <= daysEx) {
+            const key = `${ticker}-ex-${exStr}`;
+            if (!notified[key]) {
+              reminders.push({ ticker, type: 'ex', date: exStr, daysToEvent: daysToEx, amount: dv.amount, totalShares });
+              notified[key] = Date.now();
+            }
+          }
+        }
+      }
+      // Pay-date check
+      if (dv.payDate) {
+        const payMs = Date.parse(dv.payDate + 'T12:00:00Z');
+        if (!isNaN(payMs)) {
+          const daysToPay = Math.ceil((payMs - today.getTime()) / 86400000);
+          if (daysToPay >= 0 && daysToPay <= daysPay) {
+            const key = `${ticker}-pay-${dv.payDate}`;
+            if (!notified[key]) {
+              reminders.push({ ticker, type: 'pay', date: dv.payDate, daysToEvent: daysToPay, amount: dv.amount, totalShares });
+              notified[key] = Date.now();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (reminders.length === 0) {
+    return { ok: true, reason: 'No new reminders to send', sent: 0, checkedTickers: tickersToCheck.length, errors };
+  }
+
+  // Auto-prune notified entries older than 60 days; keep last 200 by recency.
+  const sixtyAgo = Date.now() - 60 * 86400000;
+  for (const k of Object.keys(notified)) {
+    if (notified[k] < sixtyAgo) delete notified[k];
+  }
+  const keys = Object.keys(notified);
+  if (keys.length > 200) {
+    keys.sort((a, b) => notified[a] - notified[b]);
+    keys.slice(0, keys.length - 200).forEach((k) => delete notified[k]);
+  }
+
+  // Send the email
+  const { subject, html, text } = buildReminderEmail(reminders);
+  const sendResult = await sendReminderEmail(env, { to: userEmail, subject, html, text });
+
+  // Write back updated notifiedReminders (only this nested field)
+  await firestorePatchFields(env, accessToken, `portfolios/${uid}`, {
+    'prefs.notifiedReminders': notified,
+  });
+
+  return {
+    ok: true,
+    sent: reminders.length,
+    to: userEmail,
+    resendId: sendResult && sendResult.id,
+    checkedTickers: tickersToCheck.length,
+    errors,
+  };
+}
+
+function isoDate(d) {
+  return d.toISOString().slice(0, 10);
+}

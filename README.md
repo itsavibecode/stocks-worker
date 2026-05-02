@@ -12,7 +12,18 @@ All endpoints require `Authorization: Bearer <Firebase ID token>` header.
 | `POST` | `/connect-url` | `{ snaptradeUserId, snaptradeUserSecret, immediateRedirect?: boolean }` | `{ redirectURI }` |
 | `POST` | `/accounts` | `{ snaptradeUserId, snaptradeUserSecret }` | `{ accounts: [...with positions inline] }` |
 | `POST` | `/transactions` | `{ snaptradeUserId, snaptradeUserSecret, startDate?, endDate? }` | `{ activities: [...], window: {startDate, endDate} }` |
+| `POST` | `/run-reminders` | — (must be OWNER_UID) | Manually trigger the dividend-reminder cron logic; returns `{ok, sent, to, resendId, checkedTickers, errors}` |
 | `GET` | `/health` | — | `{ ok: true, ts }` |
+
+## Daily dividend-reminder cron
+
+Triggered by `0 14 * * *` (9am US Eastern / 14:00 UTC). Single-user (Path B) implementation: reads `OWNER_UID`'s portfolio from Firestore via service account, fetches fresh dividend dates from Finnhub for each ticker with shares set, and sends a single rolled-up email via Resend if there's anything in the user's reminder window. Deduplicates with `prefs.notifiedReminders` (60-day auto-prune, 200 cap) so the same ex/pay-date never fires twice.
+
+Required Worker secrets/vars (in addition to the SnapTrade ones):
+- `FIREBASE_SERVICE_ACCOUNT_JSON` (secret) — full service account JSON pasted via `wrangler secret put`
+- `RESEND_API_KEY` (secret) — Resend API key
+- `OWNER_UID` (var) — Firebase UID of the single user
+- `SENDER_FROM` (var) — formatted Resend sender, e.g. `Display Name <noreply@your-verified-domain.com>`
 
 `snaptradeUserId` is always the user's Firebase UID. `snaptradeUserSecret` is opaque — the browser receives it from `/register` and stores it in its own Firestore portfolio doc, then sends it back on every subsequent call.
 

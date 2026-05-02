@@ -3,10 +3,19 @@ main = "src/index.js"
 compatibility_date = "2026-04-28"
 compatibility_flags = ["nodejs_compat"]
 
+# Daily dividend-reminder cron: 14:00 UTC = 9am US Eastern (10am during EDT).
+[triggers]
+crons = ["0 14 * * *"]
+
 # Firebase project ID is not a secret — it's already in the public stocks index.html
 # Used by the Worker to verify Firebase ID tokens issued to your users.
 [vars]
 FIREBASE_PROJECT_ID = "stockfolio-96c95"
+
+# Single-user (Path B) email-reminder configuration. UID is public-equivalent
+# (same as a Firebase auth subject). Sender domain must be verified in Resend.
+OWNER_UID = "OVMDPgJd4LP0Uts1klAQrV8Zoqb2"
+SENDER_FROM = "Stockfolio Reminders <noreply@stocks.bookhockeys.com>"
 
 # CORS allowed origins (comma-separated). Add hostnames here as deploy targets change.
 # Workers don't have a built-in env array type, so this is a comma-separated string.
@@ -15,3 +24,5 @@ ALLOWED_ORIGINS = "https://itsavibecode.github.io,http://localhost:8092,http://1
 # Secrets are set via `wrangler secret put` and never live in this file or in source:
 #   wrangler secret put SNAPTRADE_CLIENT_ID
 #   wrangler secret put SNAPTRADE_CONSUMER_KEY
+#   wrangler secret put FIREBASE_SERVICE_ACCOUNT_JSON   # JSON of service account, used for Firestore admin + Identity Toolkit lookups
+#   wrangler secret put RESEND_API_KEY                  # Resend API key for sending dividend reminders
