@@ -496,7 +496,10 @@ async function getUserEmail(env, accessToken, uid) {
 async function fetchDividendData(finnhubKey, ticker, fromDate, toDate) {
   const url = `${FINNHUB_BASE}/stock/dividend?symbol=${encodeURIComponent(ticker)}&from=${fromDate}&to=${toDate}&token=${finnhubKey}`;
   const resp = await fetch(url);
-  if (!resp.ok) return [];
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => '');
+    throw new Error(`Finnhub ${resp.status}${txt ? ': ' + txt.slice(0, 100) : ''}`);
+  }
   const data = await resp.json();
   return Array.isArray(data) ? data : [];
 }
@@ -590,10 +593,15 @@ async function runDailyReminders(env) {
   const tks = fsValueToJs(doc.fields.tickers) || [];
   const lots = fsValueToJs(doc.fields.lots) || {};
   const prefs = fsValueToJs(doc.fields.prefs) || {};
+  // dvCache is written by the browser (stocks v0.7.19+) — keyed by ticker, each
+  // entry has the same shape as the in-app DV: { ex, pd, np, a, y, ... }.
+  const dvCache = fsValueToJs(doc.fields.dvCache) || {};
+  const dvCacheTs = fsValueToJs(doc.fields.dvCacheTs) || 0;
 
   if (!prefs.remEnabled) return { ok: true, reason: 'Reminders disabled by user', sent: 0 };
-  const finnhubKey = prefs.finnhubKey;
-  if (!finnhubKey) return { ok: false, reason: 'No Finnhub key in user prefs' };
+  if (Object.keys(dvCache).length === 0) {
+    return { ok: false, reason: 'dvCache is empty in Firestore — open the stocks app at least once while signed in to seed it' };
+  }
 
   const userEmail = await getUserEmail(env, accessToken, uid);
   if (!userEmail) return { ok: false, reason: 'Could not look up user email from Firebase Auth' };
@@ -611,49 +619,44 @@ async function runDailyReminders(env) {
     const ts = lots[t] || [];
     sharesByTicker[t] = ts.reduce((s, lot) => s + (Number(lot.s) || 0), 0);
   });
-  const tickersToCheck = tks.filter((t) => !optOut[t] && sharesByTicker[t] > 0);
-
-  const fromStr = isoDate(new Date(today.getTime() - 7 * 86400000));
-  const toStr = isoDate(new Date(today.getTime() + 30 * 86400000));
+  const tickersToCheck = tks.filter((t) => !optOut[t] && sharesByTicker[t] > 0 && dvCache[t]);
 
   const reminders = [];
   const errors = [];
+  // No Finnhub call needed — we read pay/ex dates straight from dvCache.
+  // 1 Firestore read + 1 Identity Toolkit lookup + 1 Resend send = 3 subrequests
+  // total, well under Cloudflare's 50/invocation free-tier limit.
   for (const ticker of tickersToCheck) {
-    let divData;
-    try {
-      divData = await fetchDividendData(finnhubKey, ticker, fromStr, toStr);
-    } catch (e) {
-      errors.push({ ticker, error: String(e.message || e) });
-      continue;
-    }
-    for (const dv of divData) {
-      const totalShares = sharesByTicker[ticker];
-      // Ex-date check
-      const exStr = dv.exDividendDate || dv.exDate;
-      if (exStr) {
-        const exMs = Date.parse(exStr + 'T12:00:00Z');
-        if (!isNaN(exMs)) {
-          const daysToEx = Math.ceil((exMs - today.getTime()) / 86400000);
-          if (daysToEx >= 0 && daysToEx <= daysEx) {
-            const key = `${ticker}-ex-${exStr}`;
-            if (!notified[key]) {
-              reminders.push({ ticker, type: 'ex', date: exStr, daysToEvent: daysToEx, amount: dv.amount, totalShares });
-              notified[key] = Date.now();
-            }
+    const dv = dvCache[ticker];
+    if (!dv) continue;
+    const totalShares = sharesByTicker[ticker];
+    const isDivStock = (dv.rt && dv.rt !== 'None') || (dv.a && dv.a > 0);
+    if (!isDivStock) continue;
+
+    // Ex-date check
+    if (dv.ex && dv.ex !== 'N/A') {
+      const exMs = Date.parse(dv.ex + 'T12:00:00Z');
+      if (!isNaN(exMs)) {
+        const daysToEx = Math.ceil((exMs - today.getTime()) / 86400000);
+        if (daysToEx >= 0 && daysToEx <= daysEx) {
+          const key = `${ticker}-ex-${dv.ex}`;
+          if (!notified[key]) {
+            reminders.push({ ticker, type: 'ex', date: dv.ex, daysToEvent: daysToEx, amount: dv.np || 0, totalShares });
+            notified[key] = Date.now();
           }
         }
       }
-      // Pay-date check
-      if (dv.payDate) {
-        const payMs = Date.parse(dv.payDate + 'T12:00:00Z');
-        if (!isNaN(payMs)) {
-          const daysToPay = Math.ceil((payMs - today.getTime()) / 86400000);
-          if (daysToPay >= 0 && daysToPay <= daysPay) {
-            const key = `${ticker}-pay-${dv.payDate}`;
-            if (!notified[key]) {
-              reminders.push({ ticker, type: 'pay', date: dv.payDate, daysToEvent: daysToPay, amount: dv.amount, totalShares });
-              notified[key] = Date.now();
-            }
+    }
+    // Pay-date check
+    if (dv.pd && dv.pd !== 'N/A') {
+      const payMs = Date.parse(dv.pd + 'T12:00:00Z');
+      if (!isNaN(payMs)) {
+        const daysToPay = Math.ceil((payMs - today.getTime()) / 86400000);
+        if (daysToPay >= 0 && daysToPay <= daysPay) {
+          const key = `${ticker}-pay-${dv.pd}`;
+          if (!notified[key]) {
+            reminders.push({ ticker, type: 'pay', date: dv.pd, daysToEvent: daysToPay, amount: dv.np || 0, totalShares });
+            notified[key] = Date.now();
           }
         }
       }
@@ -661,7 +664,14 @@ async function runDailyReminders(env) {
   }
 
   if (reminders.length === 0) {
-    return { ok: true, reason: 'No new reminders to send', sent: 0, checkedTickers: tickersToCheck.length, errors };
+    return {
+      ok: true,
+      reason: 'No new reminders to send',
+      sent: 0,
+      checkedTickers: tickersToCheck.length,
+      dvCacheAgeHours: dvCacheTs ? Math.round((Date.now() - dvCacheTs) / 3600000) : null,
+      errors,
+    };
   }
 
   // Auto-prune notified entries older than 60 days; keep last 200 by recency.
@@ -690,6 +700,7 @@ async function runDailyReminders(env) {
     to: userEmail,
     resendId: sendResult && sendResult.id,
     checkedTickers: tickersToCheck.length,
+    dvCacheAgeHours: dvCacheTs ? Math.round((Date.now() - dvCacheTs) / 3600000) : null,
     errors,
   };
 }
