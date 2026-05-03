@@ -522,54 +522,82 @@ async function sendReminderEmail(env, { to, subject, html, text }) {
 }
 
 function buildReminderEmail(reminders) {
-  reminders.sort((a, b) => {
+  // Split into pay-date and ex-date columns; each sorted by closest first.
+  const sortAsc = (a, b) => {
     if (a.daysToEvent !== b.daysToEvent) return a.daysToEvent - b.daysToEvent;
     return a.ticker.localeCompare(b.ticker);
-  });
+  };
+  const payList = reminders.filter((r) => r.type === 'pay').sort(sortAsc);
+  const exList = reminders.filter((r) => r.type === 'ex').sort(sortAsc);
+
   const subject = `📊 Stockfolio: ${reminders.length} dividend reminder${reminders.length !== 1 ? 's' : ''}`;
-  const text = reminders
+
+  const fmtWhenText = (r) =>
+    r.daysToEvent === 0 ? 'today' : `in ${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}`;
+  const fmtWhenHtml = (r) =>
+    r.daysToEvent === 0
+      ? '<strong>today</strong>'
+      : `in <strong>${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}</strong>`;
+
+  // ── Plain-text version ──
+  const textPayLines = payList
     .map((r) => {
-      const when = r.daysToEvent === 0 ? 'today' : `in ${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}`;
-      if (r.type === 'ex') {
-        return `• ${r.ticker} ex-date ${when} (${r.date}) — buy by today to receive next dividend`;
-      }
       const total = (r.amount || 0) * (r.totalShares || 0);
-      return `• ${r.ticker} pay-date ${when} (${r.date}) — $${total.toFixed(2)} incoming (${r.totalShares} sh × $${r.amount}/sh)`;
+      return `  • ${r.ticker} ${fmtWhenText(r)} (${r.date}) — $${total.toFixed(2)} incoming (${r.totalShares} sh × $${r.amount}/sh)`;
     })
     .join('\n');
-  const html = `
-<html><body style="font-family:system-ui,-apple-system,sans-serif;background:#0d1420;color:#dfe6f0;padding:20px;max-width:600px;margin:0 auto">
-  <h2 style="color:#4e8cff;margin:0 0 16px">📊 Stockfolio Daily Reminder</h2>
-  <p style="color:#c1ccdd">${reminders.length} upcoming dividend event${reminders.length !== 1 ? 's' : ''} to flag:</p>
-  ${reminders
-    .map((r) => {
-      const when =
-        r.daysToEvent === 0
-          ? '<strong>today</strong>'
-          : `in <strong>${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}</strong>`;
-      const tagColor = r.type === 'ex' ? '#fbbf24' : '#34d399';
-      const tagText = r.type === 'ex' ? 'EX-DATE' : 'PAY-DATE';
-      let detail;
-      if (r.type === 'ex') {
-        detail = 'Buy by end of today to receive next dividend';
-      } else {
-        const total = (r.amount || 0) * (r.totalShares || 0);
-        detail = `<strong style="color:#34d399">$${total.toFixed(2)}</strong> incoming · ${r.totalShares} shares × $${r.amount}/sh`;
-      }
-      return `
-    <div style="background:#131c2e;border:1px solid #1a2540;border-radius:8px;padding:12px 16px;margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <span style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:#dfe6f0">${r.ticker}</span>
-        <span style="background:${tagColor}33;color:${tagColor};font-size:10px;font-weight:700;padding:3px 9px;border-radius:4px;letter-spacing:.5px">${tagText}</span>
+  const textExLines = exList
+    .map((r) => `  • ${r.ticker} ${fmtWhenText(r)} (${r.date}) — buy by today to receive next dividend`)
+    .join('\n');
+  const text =
+    (payList.length ? `PAY DATES (${payList.length})\n${textPayLines}\n\n` : '') +
+    (exList.length ? `EX-DIVIDEND DATES (${exList.length})\n${textExLines}\n` : '');
+
+  // ── HTML version ──
+  const cardHtml = (r) => {
+    let detail;
+    if (r.type === 'ex') {
+      detail = 'Buy by end of today to receive next dividend';
+    } else {
+      const total = (r.amount || 0) * (r.totalShares || 0);
+      detail = `<strong style="color:#34d399">$${total.toFixed(2)}</strong> incoming · ${r.totalShares} sh × $${r.amount}/sh`;
+    }
+    return `
+      <div style="background:#131c2e;border:1px solid #1a2540;border-radius:8px;padding:10px 12px;margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
+          <span style="font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:700;color:#dfe6f0">${r.ticker}</span>
+          <span style="font-size:10.5px;color:#5a6e8a;font-family:'JetBrains Mono',monospace">${r.date}</span>
+        </div>
+        <div style="font-size:12px;color:#c1ccdd;margin-bottom:3px">${fmtWhenHtml(r)}</div>
+        <div style="font-size:12px;color:#c1ccdd">${detail}</div>
+      </div>`;
+  };
+
+  const colHtml = (label, count, color, list) => `
+    <td valign="top" width="50%" style="padding:0 6px;vertical-align:top">
+      <div style="font-size:11px;font-weight:700;color:${color};text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;margin-bottom:6px;border-bottom:1px solid #1a2540">
+        ${label} (${count})
       </div>
-      <div style="font-size:13px;color:#c1ccdd">${when} (${r.date})</div>
-      <div style="font-size:13px;color:#c1ccdd;margin-top:4px">${detail}</div>
-    </div>`;
-    })
-    .join('')}
-  <p style="color:#5a6e8a;font-size:11px;margin-top:24px;border-top:1px solid #1a2540;padding-top:12px">
-    From your Portfolio Command Center · <a href="https://itsavibecode.github.io/stocks/" style="color:#4e8cff">Open app</a> · Manage in Settings → Dividend Reminders
-  </p>
+      ${list.length ? list.map(cardHtml).join('') : '<div style="font-size:11px;color:#5a6e8a;font-style:italic;padding:8px 4px">No upcoming events</div>'}
+    </td>`;
+
+  const html = `<html><body style="font-family:system-ui,-apple-system,sans-serif;background:#0d1420;color:#dfe6f0;padding:20px;margin:0">
+  <div style="max-width:680px;margin:0 auto">
+    <h2 style="color:#4e8cff;margin:0 0 6px;font-size:20px">📊 Stockfolio Daily Reminder</h2>
+    <p style="color:#c1ccdd;margin:0 0 14px;font-size:13px">
+      ${reminders.length} upcoming dividend event${reminders.length !== 1 ? 's' : ''} —
+      ${payList.length} pay date${payList.length !== 1 ? 's' : ''}, ${exList.length} ex-date${exList.length !== 1 ? 's' : ''}.
+    </p>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-collapse:separate">
+      <tr>
+        ${colHtml('💰 Pay Dates', payList.length, '#34d399', payList)}
+        ${colHtml('📅 Ex-Dividend Dates', exList.length, '#fbbf24', exList)}
+      </tr>
+    </table>
+    <p style="color:#5a6e8a;font-size:11px;margin-top:18px;border-top:1px solid #1a2540;padding-top:12px">
+      From your Portfolio Command Center · <a href="https://itsavibecode.github.io/stocks/" style="color:#4e8cff">Open app</a> · Manage in Settings → Dividend Reminders
+    </p>
+  </div>
 </body></html>`;
   return { subject, html, text };
 }
