@@ -547,7 +547,7 @@ function buildReminderEmail(reminders) {
     })
     .join('\n');
   const textExLines = exList
-    .map((r) => `  • ${r.ticker} ${fmtWhenText(r)} (${r.date}) — buy by today to receive next dividend`)
+    .map((r) => `  • ${r.ticker} ex-date ${r.date} (${fmtWhenText(r)}) — buy by close on ${tradingDayBefore(r.date)} to receive next dividend`)
     .join('\n');
   const text =
     (payList.length ? `PAY DATES (${payList.length})\n${textPayLines}\n\n` : '') +
@@ -557,28 +557,29 @@ function buildReminderEmail(reminders) {
   const cardHtml = (r) => {
     let detail;
     if (r.type === 'ex') {
-      detail = 'Buy by end of today to receive next dividend';
+      // To receive a dividend, you must own shares at market close the trading
+      // day BEFORE the ex-date. We show the calendar day before; if it falls
+      // on a weekend, we walk back to Friday (market last open).
+      detail = `Buy by close on <strong>${tradingDayBefore(r.date)}</strong> to receive next dividend`;
     } else {
       const total = (r.amount || 0) * (r.totalShares || 0);
       detail = `<strong style="color:#34d399">$${total.toFixed(2)}</strong> incoming · ${r.totalShares} sh × $${r.amount}/sh`;
     }
     return `
-      <div style="background:#131c2e;border:1px solid #1a2540;border-radius:8px;padding:10px 12px;margin-bottom:8px">
-        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
-          <span style="font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:700;color:#dfe6f0">${r.ticker}</span>
-          <span style="font-size:10.5px;color:#5a6e8a;font-family:'JetBrains Mono',monospace">${r.date}</span>
-        </div>
-        <div style="font-size:12px;color:#c1ccdd;margin-bottom:3px">${fmtWhenHtml(r)}</div>
-        <div style="font-size:12px;color:#c1ccdd">${detail}</div>
+      <div style="background:#131c2e;border:1px solid #1a2540;border-radius:8px;padding:14px 16px;margin-bottom:12px;line-height:1.4">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:#dfe6f0;letter-spacing:.5px;line-height:1.2">${r.ticker}</div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:#8a9bb0;margin-top:4px;margin-bottom:10px">${r.date}</div>
+        <div style="font-size:13px;color:#c1ccdd;margin-bottom:6px">${fmtWhenHtml(r)}</div>
+        <div style="font-size:13px;color:#c1ccdd">${detail}</div>
       </div>`;
   };
 
   const colHtml = (label, count, color, list) => `
-    <td valign="top" width="50%" style="padding:0 6px;vertical-align:top">
-      <div style="font-size:11px;font-weight:700;color:${color};text-transform:uppercase;letter-spacing:.5px;padding:6px 4px;margin-bottom:6px;border-bottom:1px solid #1a2540">
+    <td valign="top" width="50%" style="padding:0 8px;vertical-align:top">
+      <div style="font-size:12px;font-weight:700;color:${color};text-transform:uppercase;letter-spacing:.6px;padding:8px 4px 10px;margin-bottom:10px;border-bottom:1px solid #1a2540">
         ${label} (${count})
       </div>
-      ${list.length ? list.map(cardHtml).join('') : '<div style="font-size:11px;color:#5a6e8a;font-style:italic;padding:8px 4px">No upcoming events</div>'}
+      ${list.length ? list.map(cardHtml).join('') : '<div style="font-size:12px;color:#5a6e8a;font-style:italic;padding:10px 4px">No upcoming events</div>'}
     </td>`;
 
   const html = `<html><body style="font-family:system-ui,-apple-system,sans-serif;background:#0d1420;color:#dfe6f0;padding:20px;margin:0">
@@ -636,6 +637,12 @@ async function runDailyReminders(env) {
 
   const daysEx = prefs.remDaysEx == null ? 1 : Number(prefs.remDaysEx);
   const daysPay = prefs.remDaysPay == null ? 1 : Number(prefs.remDaysPay);
+  // remIncludeEx / remIncludePay: undefined defaults to true (existing users opt-in to both)
+  const includeEx = prefs.remIncludeEx !== false;
+  const includePay = prefs.remIncludePay !== false;
+  if (!includeEx && !includePay) {
+    return { ok: true, reason: 'Both ex-date and pay-date reminders are disabled', sent: 0 };
+  }
   const optOut = prefs.remOptOut || {};
   const notified = { ...(prefs.notifiedReminders || {}) };
 
@@ -662,7 +669,7 @@ async function runDailyReminders(env) {
     if (!isDivStock) continue;
 
     // Ex-date check
-    if (dv.ex && dv.ex !== 'N/A') {
+    if (includeEx && dv.ex && dv.ex !== 'N/A') {
       const exMs = Date.parse(dv.ex + 'T12:00:00Z');
       if (!isNaN(exMs)) {
         const daysToEx = Math.ceil((exMs - today.getTime()) / 86400000);
@@ -676,7 +683,7 @@ async function runDailyReminders(env) {
       }
     }
     // Pay-date check
-    if (dv.pd && dv.pd !== 'N/A') {
+    if (includePay && dv.pd && dv.pd !== 'N/A') {
       const payMs = Date.parse(dv.pd + 'T12:00:00Z');
       if (!isNaN(payMs)) {
         const daysToPay = Math.ceil((payMs - today.getTime()) / 86400000);
@@ -734,5 +741,20 @@ async function runDailyReminders(env) {
 }
 
 function isoDate(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+// Given an ex-date string (YYYY-MM-DD), return the most recent trading day
+// before it — i.e. the calendar day before, walked back to Friday if the
+// previous day falls on Sat/Sun. (Holidays not handled; close enough for
+// reminder copy.) The user must own shares at the close of THIS day to be
+// eligible for the dividend.
+function tradingDayBefore(dateStr) {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() - 1);
+  // Walk back through Sunday and Saturday
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) {
+    d.setUTCDate(d.getUTCDate() - 1);
+  }
   return d.toISOString().slice(0, 10);
 }
