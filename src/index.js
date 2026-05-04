@@ -123,66 +123,75 @@ function jsonResponse(body, status, cors) {
 // Handlers
 // ─────────────────────────────────────────────────────────────────
 async function handleRegister(request, env, uid, cors) {
-  // SnapTrade userId = Firebase UID. SnapTrade is NOT idempotent on
-  // registerUser — once a userId is registered, subsequent calls 400 with
-  // "user already exists." If the client lost their userSecret (wiped local
-  // storage, signed in on a fresh device, Firestore reset, etc.), we need a
-  // way to recover. Strategy: try registerUser first; if it fails with the
-  // "already registered" signature, fall back to resetUserSecret to mint a
-  // fresh secret for the existing userId. Both endpoints return the same
-  // {userId, userSecret} shape so the response normalizes cleanly.
+  // SnapTrade userId is normally the Firebase UID. SnapTrade is NOT idempotent
+  // on registerUser — once a userId is registered, subsequent calls 4xx with
+  // "user already exists." Their resetUserSecret endpoint REQUIRES the
+  // existing userSecret (chicken-and-egg if we lost it), so we can't recover
+  // a clean reset via API.
+  //
+  // Strategy: read `?fresh=1` from the request URL. If absent, attempt the
+  // normal registration with the Firebase UID — and if that fails, return a
+  // structured error including the original SnapTrade detail AND a hint that
+  // the client can retry with `fresh=1` to register a brand-new userId
+  // (Firebase UID + random suffix) that bypasses the conflict. Brokerages
+  // connected under the original userId become orphaned on SnapTrade's side
+  // (they still exist there, just unreachable without the original secret),
+  // and the user reconnects through the portal under the new ID. All
+  // downstream handlers accept suffixed IDs as long as they share the
+  // Firebase UID prefix.
+  const url = new URL(request.url);
+  const fresh = url.searchParams.get('fresh') === '1';
+  const userId = fresh ? `${uid}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}` : uid;
   const r = await snaptradeFetch(env, {
     method: 'POST',
     path: '/snapTrade/registerUser',
-    body: { userId: uid },
+    body: { userId },
   });
   if (r.ok) {
     return jsonResponse(
       {
         snaptradeUserId: r.data.userId,
         snaptradeUserSecret: r.data.userSecret,
+        recovered: fresh, // true means we used a suffixed ID to bypass an existing registration
       },
       200,
       cors
     );
   }
-  // Inspect the error to decide whether to retry as resetUserSecret. SnapTrade
-  // returns various shapes: {code, detail, message} or {error}. We accept any
-  // 400/409 with text mentioning "already" or "exist" as the signal. Anything
-  // else is a real failure (auth, signature, network, etc.) — surface as-is.
+  // Failed. Inspect the error so the client can decide whether to offer the
+  // fresh-suffix retry. We pass back rich detail so the toast can show what
+  // SnapTrade actually said (instead of just "registerUser failed").
   const errStr = JSON.stringify(r.error || {}).toLowerCase();
   const looksLikeExists =
-    (r.status === 400 || r.status === 409) &&
-    (errStr.includes('already') || errStr.includes('exist') || errStr.includes('1010'));
-  if (!looksLikeExists) {
-    return jsonResponse({ error: 'SnapTrade registerUser failed', detail: r.error }, r.status || 502, cors);
-  }
-  // User exists — reset the secret to recover access.
-  const reset = await snaptradeFetch(env, {
-    method: 'POST',
-    path: '/snapTrade/resetUserSecret',
-    body: { userId: uid, userIDType: 'uuid' },
-  });
-  if (!reset.ok) {
-    return jsonResponse(
-      {
-        error: 'SnapTrade user already registered, but resetUserSecret also failed',
-        registerError: r.error,
-        resetError: reset.error,
-      },
-      reset.status || 502,
-      cors
-    );
-  }
+    !fresh &&
+    (r.status === 400 || r.status === 409 || r.status === 422) &&
+    (errStr.includes('already') ||
+      errStr.includes('exist') ||
+      errStr.includes('duplicate') ||
+      errStr.includes('1010'));
   return jsonResponse(
     {
-      snaptradeUserId: reset.data.userId,
-      snaptradeUserSecret: reset.data.userSecret,
-      recovered: true,
+      error: 'SnapTrade registerUser failed',
+      detail: r.error,
+      status: r.status,
+      // Hint to the client: a `fresh=1` retry would generate a new userId.
+      // Surface this only when the failure looks like an existing-user conflict
+      // so the app can show a "register fresh?" prompt without being noisy on
+      // unrelated errors (auth, signature, etc.).
+      canRetryFresh: looksLikeExists,
     },
-    200,
+    r.status || 502,
     cors
   );
+}
+
+// Accept the authenticated Firebase UID OR any userId that starts with
+// `${uid}_` (a "fresh suffix" id minted by handleRegister with ?fresh=1).
+// This preserves the security boundary — clients still can't impersonate
+// another user — while allowing the recovery flow to use a different ID.
+function _matchesAuthUid(snaptradeUserId, uid) {
+  if (!snaptradeUserId || !uid) return false;
+  return snaptradeUserId === uid || snaptradeUserId.startsWith(uid + '_');
 }
 
 async function handleConnectUrl(request, env, uid, cors) {
@@ -191,8 +200,8 @@ async function handleConnectUrl(request, env, uid, cors) {
   if (!snaptradeUserId || !snaptradeUserSecret) {
     return jsonResponse({ error: 'snaptradeUserId and snaptradeUserSecret required' }, 400, cors);
   }
-  if (snaptradeUserId !== uid) {
-    return jsonResponse({ error: 'snaptradeUserId must match the authenticated Firebase UID' }, 403, cors);
+  if (!_matchesAuthUid(snaptradeUserId, uid)) {
+    return jsonResponse({ error: 'snaptradeUserId must be derived from the authenticated Firebase UID' }, 403, cors);
   }
   const r = await snaptradeFetch(env, {
     method: 'POST',
@@ -210,8 +219,8 @@ async function handleTransactions(request, env, uid, cors) {
   if (!snaptradeUserId || !snaptradeUserSecret) {
     return jsonResponse({ error: 'snaptradeUserId and snaptradeUserSecret required' }, 400, cors);
   }
-  if (snaptradeUserId !== uid) {
-    return jsonResponse({ error: 'snaptradeUserId must match the authenticated Firebase UID' }, 403, cors);
+  if (!_matchesAuthUid(snaptradeUserId, uid)) {
+    return jsonResponse({ error: 'snaptradeUserId must be derived from the authenticated Firebase UID' }, 403, cors);
   }
 
   // Default window: last 90 days
@@ -244,8 +253,8 @@ async function handleAccounts(request, env, uid, cors) {
   if (!snaptradeUserId || !snaptradeUserSecret) {
     return jsonResponse({ error: 'snaptradeUserId and snaptradeUserSecret required' }, 400, cors);
   }
-  if (snaptradeUserId !== uid) {
-    return jsonResponse({ error: 'snaptradeUserId must match the authenticated Firebase UID' }, 403, cors);
+  if (!_matchesAuthUid(snaptradeUserId, uid)) {
+    return jsonResponse({ error: 'snaptradeUserId must be derived from the authenticated Firebase UID' }, 403, cors);
   }
 
   const accountsR = await snaptradeFetch(env, {
