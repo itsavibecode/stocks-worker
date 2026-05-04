@@ -321,6 +321,56 @@ export default {
       if (url.pathname === '/register' && request.method === 'POST') {
         return await handleRegister(request, env, uid, cors);
       }
+      // Diagnostics: shows whether the SnapTrade secrets are set + a fingerprint
+      // (length + first/last chars) so we can spot a bad paste without exposing
+      // the secret. Restricted to OWNER_UID. NEVER returns the actual key value.
+      if (url.pathname === '/debug-snaptrade' && request.method === 'GET') {
+        if (uid !== env.OWNER_UID) {
+          return jsonResponse({ error: 'Restricted to OWNER_UID' }, 403, cors);
+        }
+        const cid = env.SNAPTRADE_CLIENT_ID || '';
+        const ck = env.SNAPTRADE_CONSUMER_KEY || '';
+        // Run an unauthenticated SnapTrade health check too (status endpoint
+        // does not require signing) so we can confirm the API is reachable.
+        let apiPing = null;
+        try {
+          const r = await fetch(`${SNAPTRADE_BASE}/`, { method: 'GET' });
+          apiPing = { status: r.status, ok: r.ok };
+        } catch (e) {
+          apiPing = { error: String(e.message || e) };
+        }
+        // Run a signed status call so we exercise the same code path as
+        // /register and surface whatever SnapTrade returns. Uses no body.
+        let signedTest = null;
+        try {
+          const sr = await snaptradeFetch(env, {
+            method: 'GET',
+            path: '/snapTrade/listUsers',
+          });
+          signedTest = sr.ok
+            ? { ok: true, userCount: Array.isArray(sr.data) ? sr.data.length : null }
+            : { ok: false, status: sr.status, error: sr.error };
+        } catch (e) {
+          signedTest = { error: String(e.message || e) };
+        }
+        return jsonResponse(
+          {
+            clientIdSet: !!cid,
+            clientIdLength: cid.length,
+            clientIdFingerprint: cid ? `${cid.slice(0, 4)}…${cid.slice(-4)}` : null,
+            consumerKeySet: !!ck,
+            consumerKeyLength: ck.length,
+            consumerKeyFingerprint: ck ? `${ck.slice(0, 3)}…${ck.slice(-3)}` : null,
+            consumerKeyHasWhitespace: /\s/.test(ck),
+            consumerKeyTrimmedDiffers: ck !== ck.trim(),
+            apiPing,
+            signedTest,
+            workerVersion: '0.5.2',
+          },
+          200,
+          cors
+        );
+      }
       if (url.pathname === '/connect-url' && request.method === 'POST') {
         return await handleConnectUrl(request, env, uid, cors);
       }
