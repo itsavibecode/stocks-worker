@@ -123,18 +123,62 @@ function jsonResponse(body, status, cors) {
 // Handlers
 // ─────────────────────────────────────────────────────────────────
 async function handleRegister(request, env, uid, cors) {
-  // SnapTrade userId = Firebase UID. Idempotent: SnapTrade returns existing
-  // user data if you re-register the same userId.
+  // SnapTrade userId = Firebase UID. SnapTrade is NOT idempotent on
+  // registerUser — once a userId is registered, subsequent calls 400 with
+  // "user already exists." If the client lost their userSecret (wiped local
+  // storage, signed in on a fresh device, Firestore reset, etc.), we need a
+  // way to recover. Strategy: try registerUser first; if it fails with the
+  // "already registered" signature, fall back to resetUserSecret to mint a
+  // fresh secret for the existing userId. Both endpoints return the same
+  // {userId, userSecret} shape so the response normalizes cleanly.
   const r = await snaptradeFetch(env, {
     method: 'POST',
     path: '/snapTrade/registerUser',
     body: { userId: uid },
   });
-  if (!r.ok) return jsonResponse({ error: 'SnapTrade registerUser failed', detail: r.error }, r.status || 502, cors);
+  if (r.ok) {
+    return jsonResponse(
+      {
+        snaptradeUserId: r.data.userId,
+        snaptradeUserSecret: r.data.userSecret,
+      },
+      200,
+      cors
+    );
+  }
+  // Inspect the error to decide whether to retry as resetUserSecret. SnapTrade
+  // returns various shapes: {code, detail, message} or {error}. We accept any
+  // 400/409 with text mentioning "already" or "exist" as the signal. Anything
+  // else is a real failure (auth, signature, network, etc.) — surface as-is.
+  const errStr = JSON.stringify(r.error || {}).toLowerCase();
+  const looksLikeExists =
+    (r.status === 400 || r.status === 409) &&
+    (errStr.includes('already') || errStr.includes('exist') || errStr.includes('1010'));
+  if (!looksLikeExists) {
+    return jsonResponse({ error: 'SnapTrade registerUser failed', detail: r.error }, r.status || 502, cors);
+  }
+  // User exists — reset the secret to recover access.
+  const reset = await snaptradeFetch(env, {
+    method: 'POST',
+    path: '/snapTrade/resetUserSecret',
+    body: { userId: uid, userIDType: 'uuid' },
+  });
+  if (!reset.ok) {
+    return jsonResponse(
+      {
+        error: 'SnapTrade user already registered, but resetUserSecret also failed',
+        registerError: r.error,
+        resetError: reset.error,
+      },
+      reset.status || 502,
+      cors
+    );
+  }
   return jsonResponse(
     {
-      snaptradeUserId: r.data.userId,
-      snaptradeUserSecret: r.data.userSecret,
+      snaptradeUserId: reset.data.userId,
+      snaptradeUserSecret: reset.data.userSecret,
+      recovered: true,
     },
     200,
     cors
