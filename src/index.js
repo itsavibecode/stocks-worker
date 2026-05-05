@@ -214,7 +214,12 @@ async function handleConnectUrl(request, env, uid, cors) {
     method: 'POST',
     path: '/snapTrade/login',
     query: { userId: snaptradeUserId, userSecret: snaptradeUserSecret },
-    body: immediateRedirect ? { immediateRedirect: true } : {},
+    // Pass null (not {}) when no login config is needed. SnapTrade's SDK
+    // convention is `body || null`: empty objects must NOT be sent because
+    // their signature reconstruction uses `null` for "no body" and our `{}`
+    // produced a content mismatch (signature OK on listUsers because that
+    // call has no body, but POST /login was getting 1076).
+    body: immediateRedirect ? { immediateRedirect: true } : null,
   });
   if (!r.ok) return jsonResponse({ error: 'SnapTrade login failed', detail: r.error }, r.status || 502, cors);
   return jsonResponse({ redirectURI: r.data.redirectURI || r.data.redirectUri || r.data }, 200, cors);
@@ -372,7 +377,7 @@ export default {
             consumerKeyTrimmedDiffers: ck !== ck.trim(),
             apiPing,
             signedTest,
-            workerVersion: '0.5.3',
+            workerVersion: '0.5.4',
           },
           200,
           cors
