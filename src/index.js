@@ -72,9 +72,16 @@ async function snaptradeFetch(env, { method, path, query = {}, body = null }) {
   const ts = Math.floor(Date.now() / 1000).toString();
   const allQuery = { ...query, clientId: env.SNAPTRADE_CLIENT_ID, timestamp: ts };
   const queryString = buildQuery(allQuery);
+  // SnapTrade verifies signatures using the FULL request path including the
+  // /api/v1 version prefix (this matches their reference Postman script and
+  // TypeScript SDK — both pull the path off the full URL). Earlier worker
+  // versions signed with just `/snapTrade/...` which always produced a
+  // mismatch; SnapTrade returned code 1076 "Unable to verify signature sent".
+  const SNAPTRADE_API_PATH_PREFIX = '/api/v1';
+  const fullPath = SNAPTRADE_API_PATH_PREFIX + path;
   const sigPayload = JSON.stringify({
     content: body,
-    path,
+    path: fullPath,
     query: queryString,
   });
   const signature = await hmacSha256Base64(env.SNAPTRADE_CONSUMER_KEY, sigPayload);
@@ -365,7 +372,7 @@ export default {
             consumerKeyTrimmedDiffers: ck !== ck.trim(),
             apiPing,
             signedTest,
-            workerVersion: '0.5.2',
+            workerVersion: '0.5.3',
           },
           200,
           cors
