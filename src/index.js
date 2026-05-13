@@ -654,15 +654,38 @@ function buildReminderEmail(reminders) {
       ? '<strong>today</strong>'
       : `in <strong>${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}</strong>`;
 
+  // Coverage warning helpers — surface only when we have data AND it's a
+  // concerning level. Strong/OK coverage is silently fine (no clutter).
+  const covWarnText = (r) => {
+    if (!r.coverage || !r.covStatus) return '';
+    if (r.covStatus === 'risk') return `  ⚠ At risk: dividend coverage ${r.coverage.toFixed(2)}× (operating cash flow vs. dividends paid)`;
+    if (r.covStatus === 'tight') return `  ⚠ Tight: dividend coverage ${r.coverage.toFixed(2)}× — watch for safety changes`;
+    return '';
+  };
+  const covWarnHtml = (r) => {
+    if (!r.coverage || !r.covStatus) return '';
+    if (r.covStatus === 'risk') {
+      return `<div style="margin-top:8px;padding:6px 10px;background:#3a1a1a;border-left:3px solid #f87171;border-radius:4px;font-size:11.5px;color:#fca5a5;line-height:1.4"><strong>⚠ At risk:</strong> dividend coverage <strong>${r.coverage.toFixed(2)}×</strong> — operating cash flow vs. dividends paid. &lt;1× means the dividend is being funded by debt or asset sales.</div>`;
+    }
+    if (r.covStatus === 'tight') {
+      return `<div style="margin-top:8px;padding:6px 10px;background:#3a3018;border-left:3px solid #fbbf24;border-radius:4px;font-size:11.5px;color:#fcd34d;line-height:1.4"><strong>⚠ Tight:</strong> dividend coverage <strong>${r.coverage.toFixed(2)}×</strong> — watch for changes in payout policy.</div>`;
+    }
+    return '';
+  };
+
   // ── Plain-text version ──
   const textPayLines = payList
     .map((r) => {
       const total = (r.amount || 0) * (r.totalShares || 0);
-      return `  • ${r.ticker} ${fmtWhenText(r)} (${r.date}) — $${total.toFixed(2)} incoming (${r.totalShares} sh × $${r.amount}/sh)`;
+      const cov = covWarnText(r);
+      return `  • ${r.ticker} ${fmtWhenText(r)} (${r.date}) — $${total.toFixed(2)} incoming (${r.totalShares} sh × $${r.amount}/sh)${cov ? '\n' + cov : ''}`;
     })
     .join('\n');
   const textExLines = exList
-    .map((r) => `  • ${r.ticker} ex-date ${r.date} (${fmtWhenText(r)}) — buy by close on ${tradingDayBefore(r.date)} to receive next dividend`)
+    .map((r) => {
+      const cov = covWarnText(r);
+      return `  • ${r.ticker} ex-date ${r.date} (${fmtWhenText(r)}) — buy by close on ${tradingDayBefore(r.date)} to receive next dividend${cov ? '\n' + cov : ''}`;
+    })
     .join('\n');
   const text =
     (payList.length ? `PAY DATES (${payList.length})\n${textPayLines}\n\n` : '') +
@@ -686,6 +709,7 @@ function buildReminderEmail(reminders) {
         <div style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:#8a9bb0;margin-top:4px;margin-bottom:10px">${r.date}</div>
         <div style="font-size:13px;color:#c1ccdd;margin-bottom:6px">${fmtWhenHtml(r)}</div>
         <div style="font-size:13px;color:#c1ccdd">${detail}</div>
+        ${covWarnHtml(r)}
       </div>`;
   };
 
@@ -711,7 +735,7 @@ function buildReminderEmail(reminders) {
       </tr>
     </table>
     <p style="color:#5a6e8a;font-size:11px;margin-top:18px;border-top:1px solid #1a2540;padding-top:12px">
-      From your Portfolio Command Center · <a href="https://itsavibecode.github.io/stocks/" style="color:#4e8cff">Open app</a> · Manage in Settings → Dividend Reminders
+      From Stockfolio · <a href="https://itsavibecode.github.io/stocks/" style="color:#4e8cff">Open app</a> · Manage in Settings → Dividend Reminders
     </p>
   </div>
 </body></html>`;
@@ -823,6 +847,44 @@ async function runDailyReminders(env) {
       errors,
     };
   }
+
+  // Enrich each reminder with company-level dividend coverage from the
+  // shared /fundamentals/{ticker} Firestore collection (worker v0.5.x +
+  // stocks app v0.7.42+). If a ticker's OCF/dividend ratio is below 2x,
+  // we surface a "tight" or "at risk" warning in the email so the user
+  // knows about coverage risk alongside the date reminder. Cache miss
+  // (no fundamentals fetched yet) just leaves coverage undefined → no
+  // warning rendered. Uses dedup so multi-event tickers only do one read.
+  const fundCache = {};
+  const uniqueTickers = Array.from(new Set(reminders.map((r) => r.ticker)));
+  for (const tk of uniqueTickers) {
+    try {
+      const fdoc = await firestoreGetDoc(env, accessToken, `fundamentals/${tk}`);
+      if (fdoc && fdoc.fields) {
+        const cov = fsValueToJs(fdoc.fields.coverage);
+        const ocf = fsValueToJs(fdoc.fields.ocf);
+        const fetchedAt = fsValueToJs(fdoc.fields.fetchedAt);
+        // Treat data older than 180 days as too stale to base a warning on
+        const isFresh = fetchedAt && (Date.now() - fetchedAt) < 180 * 86400000;
+        if (isFresh && typeof cov === 'number' && cov > 0) {
+          fundCache[tk] = { coverage: cov, ocf: ocf || 0 };
+        }
+      }
+    } catch (e) {
+      // Non-fatal — skip enrichment for this ticker, send reminder anyway
+      errors.push({ stage: 'fundamentals-read', ticker: tk, message: String(e.message || e) });
+    }
+  }
+  // Attach coverage status to each reminder
+  reminders.forEach((r) => {
+    const f = fundCache[r.ticker];
+    if (!f) return;
+    r.coverage = f.coverage;
+    if (f.coverage < 1) r.covStatus = 'risk';
+    else if (f.coverage < 1.5) r.covStatus = 'tight';
+    else if (f.coverage < 2) r.covStatus = 'ok';
+    else r.covStatus = 'strong';
+  });
 
   // Auto-prune notified entries older than 60 days; keep last 200 by recency.
   const sixtyAgo = Date.now() - 60 * 86400000;
