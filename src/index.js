@@ -645,14 +645,30 @@ function buildReminderEmail(reminders) {
   const payList = reminders.filter((r) => r.type === 'pay').sort(sortAsc);
   const exList = reminders.filter((r) => r.type === 'ex').sort(sortAsc);
 
-  const subject = `📊 Stockfolio: ${reminders.length} dividend reminder${reminders.length !== 1 ? 's' : ''}`;
+  // Subject line — if any pay-date reminder is day-of (daysToEvent === 0)
+  // we tag the subject with a 💰 prefix and "paid today" so the email reads
+  // as a payday confirmation in the inbox preview, not just another
+  // reminder. Advance-notice batches keep the original 📊 prefix.
+  const paidToday = reminders.filter((r) => r.type === 'pay' && r.daysToEvent === 0);
+  const subject = paidToday.length > 0
+    ? `💰 Stockfolio: ${paidToday.length} dividend${paidToday.length !== 1 ? 's' : ''} paid today${reminders.length > paidToday.length ? ` + ${reminders.length - paidToday.length} upcoming` : ''}`
+    : `📊 Stockfolio: ${reminders.length} dividend reminder${reminders.length !== 1 ? 's' : ''}`;
 
-  const fmtWhenText = (r) =>
-    r.daysToEvent === 0 ? 'today' : `in ${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}`;
-  const fmtWhenHtml = (r) =>
-    r.daysToEvent === 0
-      ? '<strong>today</strong>'
-      : `in <strong>${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}</strong>`;
+  // "when" phrasing — pay-type entries with daysToEvent === 0 swap from
+  // "today" (reminder language) to "paid today" (confirmation language).
+  // Ex-date entries and future pay dates keep the original wording.
+  const fmtWhenText = (r) => {
+    if (r.daysToEvent === 0) return r.type === 'pay' ? 'paid today 💰' : 'today';
+    return `in ${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}`;
+  };
+  const fmtWhenHtml = (r) => {
+    if (r.daysToEvent === 0) {
+      return r.type === 'pay'
+        ? '<strong style="color:#34d399">💰 Paid today</strong>'
+        : '<strong>today</strong>';
+    }
+    return `in <strong>${r.daysToEvent} day${r.daysToEvent !== 1 ? 's' : ''}</strong>`;
+  };
 
   // Coverage warning helpers — surface only when we have data AND it's a
   // concerning level. Strong/OK coverage is silently fine (no clutter).
@@ -674,11 +690,14 @@ function buildReminderEmail(reminders) {
   };
 
   // ── Plain-text version ──
+  // "received" for day-of payments; "incoming" for advance notices — so the
+  // day-of email reads as confirmation rather than another forward reminder.
   const textPayLines = payList
     .map((r) => {
       const total = (r.amount || 0) * (r.totalShares || 0);
       const cov = covWarnText(r);
-      return `  • ${r.ticker} ${fmtWhenText(r)} (${r.date}) — $${total.toFixed(2)} incoming (${r.totalShares} sh × $${r.amount}/sh)${cov ? '\n' + cov : ''}`;
+      const verb = r.daysToEvent === 0 ? 'received' : 'incoming';
+      return `  • ${r.ticker} ${fmtWhenText(r)} (${r.date}) — $${total.toFixed(2)} ${verb} (${r.totalShares} sh × $${r.amount}/sh)${cov ? '\n' + cov : ''}`;
     })
     .join('\n');
   const textExLines = exList
@@ -692,19 +711,25 @@ function buildReminderEmail(reminders) {
     (exList.length ? `EX-DIVIDEND DATES (${exList.length})\n${textExLines}\n` : '');
 
   // ── HTML version ──
+  // Pay-type cards with daysToEvent === 0 use confirmation language
+  // ("received") + a softly tinted green background border accent so the
+  // payday confirmation visually pops from the regular advance-notice
+  // reminders sitting in the same column.
   const cardHtml = (r) => {
     let detail;
+    let cardAccent = 'border:1px solid #1a2540';
     if (r.type === 'ex') {
-      // To receive a dividend, you must own shares at market close the trading
-      // day BEFORE the ex-date. We show the calendar day before; if it falls
-      // on a weekend, we walk back to Friday (market last open).
       detail = `Buy by close on <strong>${tradingDayBefore(r.date)}</strong> to receive next dividend`;
+    } else if (r.daysToEvent === 0) {
+      const total = (r.amount || 0) * (r.totalShares || 0);
+      detail = `<strong style="color:#34d399">$${total.toFixed(2)}</strong> received · ${r.totalShares} sh × $${r.amount}/sh`;
+      cardAccent = 'border:1px solid #1a3a2a;border-left:3px solid #34d399';
     } else {
       const total = (r.amount || 0) * (r.totalShares || 0);
       detail = `<strong style="color:#34d399">$${total.toFixed(2)}</strong> incoming · ${r.totalShares} sh × $${r.amount}/sh`;
     }
     return `
-      <div style="background:#131c2e;border:1px solid #1a2540;border-radius:8px;padding:14px 16px;margin-bottom:12px;line-height:1.4">
+      <div style="background:#131c2e;${cardAccent};border-radius:8px;padding:14px 16px;margin-bottom:12px;line-height:1.4">
         <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:#dfe6f0;letter-spacing:.5px;line-height:1.2">${r.ticker}</div>
         <div style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:#8a9bb0;margin-top:4px;margin-bottom:10px">${r.date}</div>
         <div style="font-size:13px;color:#c1ccdd;margin-bottom:6px">${fmtWhenHtml(r)}</div>
