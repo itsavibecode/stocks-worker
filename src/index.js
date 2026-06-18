@@ -401,6 +401,16 @@ export default {
         const result = await runDailyReminders(env);
         return jsonResponse(result, 200, cors);
       }
+      // Same manual-trigger semantics as /run-reminders but for the monthly
+      // digest. OWNER_UID-only. Useful for previewing what the 1st-of-month
+      // email will contain without waiting for the schedule.
+      if (url.pathname === '/run-digest' && request.method === 'POST') {
+        if (uid !== env.OWNER_UID) {
+          return jsonResponse({ error: 'Manual digest trigger restricted to OWNER_UID' }, 403, cors);
+        }
+        const result = await runMonthlyDigest(env);
+        return jsonResponse(result, 200, cors);
+      }
       return jsonResponse({ error: 'Not found' }, 404, cors);
     } catch (e) {
       console.error('Handler error:', e);
@@ -408,14 +418,28 @@ export default {
     }
   },
 
-  // Scheduled (cron) handler — runs daily at the time configured in wrangler.toml's
-  // [triggers] crons. Single user (OWNER_UID); see runDailyReminders for the logic.
+  // Scheduled (cron) handler — dispatches based on which cron expression
+  // fired this invocation. wrangler.toml configures two crons:
+  //   - "0 14 * * *"    → daily dividend reminders (every day, 14:00 UTC)
+  //   - "0 12 1 * *"    → monthly digest (1st of each month, 12:00 UTC)
+  // event.cron contains the literal cron expression Cloudflare matched.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(
-      runDailyReminders(env).catch((err) => {
-        console.error('Cron run failed:', err);
-      })
-    );
+    const cron = event.cron || '';
+    if (cron === '0 12 1 * *') {
+      ctx.waitUntil(
+        runMonthlyDigest(env).catch((err) => {
+          console.error('Monthly digest cron failed:', err);
+        })
+      );
+    } else {
+      // Default → daily reminders (matches the existing "0 14 * * *" trigger
+      // and any future single-event daily schedules).
+      ctx.waitUntil(
+        runDailyReminders(env).catch((err) => {
+          console.error('Daily reminder cron failed:', err);
+        })
+      );
+    }
   },
 };
 
@@ -940,6 +964,194 @@ async function runDailyReminders(env) {
     dvCacheAgeHours: dvCacheTs ? Math.round((Date.now() - dvCacheTs) / 3600000) : null,
     errors,
   };
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// MONTHLY DIGEST — sent on the 1st of each month at 12:00 UTC.
+// Lists every upcoming dividend payout in the calendar month (pay date
+// falls within the next 32 days), grouped by date, with per-ticker
+// detail (current price, amount/sh, shares, total) and a grand-total
+// line. Default ON for all users; opt out via prefs.monthlyDigestEnabled
+// = false. Reuses the same dvCache + cache.prices the daily reminder
+// uses — no extra Firestore reads beyond the user's own portfolio doc.
+// ═════════════════════════════════════════════════════════════════════
+async function runMonthlyDigest(env) {
+  const uid = env.OWNER_UID;
+  if (!uid) return { ok: false, reason: 'OWNER_UID env var not set' };
+  const accessToken = await getServiceAccountToken(env);
+  const doc = await firestoreGetDoc(env, accessToken, `portfolios/${uid}`);
+  if (!doc || !doc.fields) {
+    return { ok: false, reason: 'Portfolio doc not found for OWNER_UID' };
+  }
+
+  const tks = fsValueToJs(doc.fields.tickers) || [];
+  const lots = fsValueToJs(doc.fields.lots) || {};
+  const prefs = fsValueToJs(doc.fields.prefs) || {};
+  const dvCache = fsValueToJs(doc.fields.dvCache) || {};
+  const cache = fsValueToJs(doc.fields.cache) || {};
+  const livePrices = (cache && cache.prices) || {};
+
+  // Opt-out: default ON. Only !== false skips the digest.
+  if (prefs.monthlyDigestEnabled === false) {
+    return { ok: true, reason: 'Monthly digest disabled by user', sent: 0, skipped: true };
+  }
+  if (Object.keys(dvCache).length === 0) {
+    return { ok: false, reason: 'dvCache is empty — open the stocks app at least once while signed in to seed it' };
+  }
+
+  const userEmail = await getUserEmail(env, accessToken, uid);
+  if (!userEmail) return { ok: false, reason: 'Could not look up user email from Firebase Auth' };
+
+  // Compute per-ticker share counts and the digest window. Window = 32 days
+  // out from today (covers the full upcoming calendar month for any 1st-of-month run).
+  const sharesByTicker = {};
+  tks.forEach((t) => {
+    const ts = lots[t] || [];
+    sharesByTicker[t] = ts.reduce((s, lot) => s + (Number(lot.s) || 0), 0);
+  });
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const windowEnd = new Date(today.getTime() + 32 * 86400000);
+
+  // Build payouts list — only tickers with shares > 0 and a pay date in window
+  const payouts = [];
+  for (const ticker of tks) {
+    const shares = sharesByTicker[ticker];
+    if (!shares || shares <= 0) continue;
+    const dv = dvCache[ticker];
+    if (!dv || !dv.pd || dv.pd === 'N/A') continue;
+    const payMs = Date.parse(dv.pd + 'T12:00:00Z');
+    if (isNaN(payMs)) continue;
+    if (payMs < today.getTime() || payMs > windowEnd.getTime()) continue;
+    const amountPerShare = Number(dv.np) || 0;
+    if (amountPerShare <= 0) continue;
+    payouts.push({
+      ticker,
+      payDate: dv.pd,
+      payMs,
+      amountPerShare,
+      shares,
+      total: amountPerShare * shares,
+      price: Number(livePrices[ticker]) || null,
+      yield: Number(dv.y) || null,
+      frequency: dv.f || '',
+    });
+  }
+
+  if (payouts.length === 0) {
+    return {
+      ok: true,
+      reason: 'No upcoming payouts in the next 32 days',
+      sent: 0,
+      skipped: true,
+    };
+  }
+
+  // Sort by pay date ascending so the email reads chronologically
+  payouts.sort((a, b) => a.payMs - b.payMs);
+
+  const grandTotal = payouts.reduce((s, p) => s + p.total, 0);
+
+  const { subject, html, text } = buildMonthlyDigestEmail(payouts, grandTotal, today);
+  const sendResult = await sendReminderEmail(env, { to: userEmail, subject, html, text });
+
+  return {
+    ok: true,
+    sent: 1,
+    to: userEmail,
+    resendId: sendResult && sendResult.id,
+    payoutCount: payouts.length,
+    totalDollar: '$' + grandTotal.toFixed(2),
+  };
+}
+
+function buildMonthlyDigestEmail(payouts, grandTotal, today) {
+  const monthLabel = today.toLocaleDateString('en-US', {
+    month: 'long', year: 'numeric', timeZone: 'UTC',
+  });
+  const subject = `📅 Stockfolio Monthly Digest — ${payouts.length} payout${payouts.length !== 1 ? 's' : ''} · $${grandTotal.toFixed(2)} expected`;
+  const fmtD = (d) => '$' + (Number(d) || 0).toFixed(2);
+
+  // ── Plain-text version ──
+  const textLines = payouts.map((p) => {
+    const priceStr = p.price ? `(price $${p.price.toFixed(2)})` : '';
+    return `  • ${p.payDate} · ${p.ticker} ${priceStr} — ${p.shares} sh × $${p.amountPerShare} = ${fmtD(p.total)}`;
+  });
+  const text =
+    `STOCKFOLIO MONTHLY DIGEST — ${monthLabel}\n` +
+    `${payouts.length} upcoming payout${payouts.length !== 1 ? 's' : ''} in the next ~30 days\n\n` +
+    textLines.join('\n') +
+    `\n\nGRAND TOTAL: ${fmtD(grandTotal)}\n\n` +
+    `(One email per month on the 1st. To opt out, open Stockfolio → Settings → Notifications → Monthly Dividend Digest.)\n`;
+
+  // ── HTML version ──
+  // Each payout gets one row in the table; the grand-total row sits at
+  // the bottom of the table with an accent background so it pops.
+  const rowsHtml = payouts.map((p) => {
+    const priceCell = p.price
+      ? `<span style="color:#dfe6f0;font-family:'JetBrains Mono',monospace">$${p.price.toFixed(2)}</span>`
+      : `<span style="color:#5a6e8a;font-style:italic">—</span>`;
+    const yieldCell = p.yield
+      ? `<span style="color:#8a9bb0;font-size:11px">${p.yield}%</span>`
+      : '';
+    return `
+      <tr>
+        <td style="padding:10px 8px;border-bottom:1px solid #1a2540;font-family:'JetBrains Mono',monospace;font-size:12px;color:#8a9bb0;white-space:nowrap">${p.payDate}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #1a2540;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:#dfe6f0">${p.ticker}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #1a2540;text-align:right;white-space:nowrap">${priceCell}<br>${yieldCell}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #1a2540;text-align:right;font-family:'JetBrains Mono',monospace;font-size:12px;color:#c1ccdd;white-space:nowrap">${p.shares} × $${p.amountPerShare}</td>
+        <td style="padding:10px 8px;border-bottom:1px solid #1a2540;text-align:right;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;color:#34d399;white-space:nowrap">${fmtD(p.total)}</td>
+      </tr>`;
+  }).join('');
+
+  const html = `
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0a0e1a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#dfe6f0">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0a0e1a">
+    <tr><td align="center" style="padding:24px 12px">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:680px">
+        <tr><td style="padding:20px 24px 8px">
+          <div style="font-size:22px;font-weight:800;color:#dfe6f0;letter-spacing:.3px">Stockfolio Monthly Digest</div>
+          <div style="font-size:13px;color:#8a9bb0;margin-top:6px">${monthLabel} · ${payouts.length} upcoming payout${payouts.length !== 1 ? 's' : ''}</div>
+        </td></tr>
+        <tr><td style="padding:8px 24px 16px">
+          <div style="background:linear-gradient(135deg,#0e1a32,#16223e);border:1px solid #1a3a5a;border-radius:10px;padding:16px 18px">
+            <div style="font-size:12px;color:#8a9bb0;text-transform:uppercase;letter-spacing:.8px;font-weight:600">Expected this month</div>
+            <div style="font-size:32px;font-weight:800;color:#34d399;font-family:'JetBrains Mono',monospace;margin-top:4px">${fmtD(grandTotal)}</div>
+            <div style="font-size:11.5px;color:#8a9bb0;margin-top:6px">Across ${new Set(payouts.map((p) => p.ticker)).size} ticker${new Set(payouts.map((p) => p.ticker)).size !== 1 ? 's' : ''} · sum of <em>amount × shares</em> for every payout in the next 32 days</div>
+          </div>
+        </td></tr>
+        <tr><td style="padding:0 24px 16px">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#131c2e;border:1px solid #1a2540;border-radius:10px;border-collapse:separate;border-spacing:0">
+            <thead>
+              <tr style="background:#0e1626">
+                <th style="padding:10px 8px;text-align:left;font-size:10.5px;color:#8a9bb0;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #1a2540">Pay Date</th>
+                <th style="padding:10px 8px;text-align:left;font-size:10.5px;color:#8a9bb0;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #1a2540">Ticker</th>
+                <th style="padding:10px 8px;text-align:right;font-size:10.5px;color:#8a9bb0;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #1a2540">Current Price / Yield</th>
+                <th style="padding:10px 8px;text-align:right;font-size:10.5px;color:#8a9bb0;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #1a2540">Shares × Amount</th>
+                <th style="padding:10px 8px;text-align:right;font-size:10.5px;color:#8a9bb0;font-weight:700;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid #1a2540">Total</th>
+              </tr>
+            </thead>
+            <tbody>${rowsHtml}</tbody>
+            <tfoot>
+              <tr style="background:#16223e">
+                <td colspan="4" style="padding:14px 8px;font-size:13px;font-weight:700;color:#dfe6f0;text-align:right;border-top:2px solid #34d399">Grand total</td>
+                <td style="padding:14px 8px;text-align:right;font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:800;color:#34d399;border-top:2px solid #34d399">${fmtD(grandTotal)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </td></tr>
+        <tr><td style="padding:8px 24px 24px;color:#5a6e8a;font-size:11px;line-height:1.6">
+          One email per month on the 1st. Prices shown are the most recent value cached by the Stockfolio web app — open the app at least once during the month so the worker can pick up fresh prices.<br>
+          To opt out, open Stockfolio → Settings → 🔔 Notifications → Monthly Dividend Digest.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+
+  return { subject, html, text };
 }
 
 function isoDate(d) {

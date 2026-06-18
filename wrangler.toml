@@ -11,9 +11,15 @@ compatibility_flags = ["nodejs_compat"]
 # profile helper) before `npx wrangler deploy`.
 account_id = "fe16eca597b8d5afa20dfe7b2550640b"
 
-# Daily dividend-reminder cron: 14:00 UTC = 9am US Eastern (10am during EDT).
+# Two cron triggers:
+#   "0 14 * * *"   — Daily dividend reminders at 14:00 UTC (9am US Eastern,
+#                    10am during EDT). Same since worker v0.3.0.
+#   "0 12 1 * *"   — Monthly digest of upcoming payouts, on the 1st of each
+#                    month at 12:00 UTC (7am US Eastern, 8am during EDT).
+#                    Added in worker v0.7.0. The scheduled() handler in
+#                    src/index.js dispatches by event.cron.
 [triggers]
-crons = ["0 14 * * *"]
+crons = ["0 14 * * *", "0 12 1 * *"]
 
 # Firebase project ID is not a secret — it's already in the public stocks index.html
 # Used by the Worker to verify Firebase ID tokens issued to your users.
