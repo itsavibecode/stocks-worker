@@ -1,6 +1,6 @@
 {
   "name": "stocks-worker",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "private": true,
   "description": "Cloudflare Worker backend for the stocks app — proxies SnapTrade requests with Firebase-authenticated calls. Holds SnapTrade clientSecret as a Worker secret so it never reaches the browser.",
   "type": "module",

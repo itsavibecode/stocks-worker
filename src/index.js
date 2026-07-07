@@ -418,25 +418,22 @@ export default {
     }
   },
 
-  // Scheduled (cron) handler — dispatches based on which cron expression
-  // fired this invocation. wrangler.toml configures two crons:
-  //   - "0 14 * * *"    → daily dividend reminders (every day, 14:00 UTC)
-  //   - "0 12 1 * *"    → monthly digest (1st of each month, 12:00 UTC)
-  // event.cron contains the literal cron expression Cloudflare matched.
+  // Scheduled (cron) handler — a single daily trigger ("0 14 * * *").
+  // v0.7.1: the former second cron ("0 12 1 * *", monthly digest) was folded
+  // into this one to free a cron slot — free CF accounts allow 5 triggers
+  // total and the account was full. On the 1st of the month (UTC) the daily
+  // fire also runs the monthly digest, which now goes out at 14:00 UTC
+  // instead of 12:00 on that day.
   async scheduled(event, env, ctx) {
-    const cron = event.cron || '';
-    if (cron === '0 12 1 * *') {
+    ctx.waitUntil(
+      runDailyReminders(env).catch((err) => {
+        console.error('Daily reminder cron failed:', err);
+      })
+    );
+    if (new Date().getUTCDate() === 1) {
       ctx.waitUntil(
         runMonthlyDigest(env).catch((err) => {
           console.error('Monthly digest cron failed:', err);
-        })
-      );
-    } else {
-      // Default → daily reminders (matches the existing "0 14 * * *" trigger
-      // and any future single-event daily schedules).
-      ctx.waitUntil(
-        runDailyReminders(env).catch((err) => {
-          console.error('Daily reminder cron failed:', err);
         })
       );
     }

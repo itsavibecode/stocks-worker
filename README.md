@@ -17,7 +17,7 @@ All endpoints require `Authorization: Bearer <Firebase ID token>` header.
 
 ## Daily dividend-reminder cron
 
-Triggered by `0 14 * * *` (9am US Eastern / 14:00 UTC). Single-user (Path B) implementation: reads `OWNER_UID`'s portfolio from Firestore via service account, fetches fresh dividend dates from Finnhub for each ticker with shares set, and sends a single rolled-up email via Resend if there's anything in the user's reminder window. Deduplicates with `prefs.notifiedReminders` (60-day auto-prune, 200 cap) so the same ex/pay-date never fires twice.
+Triggered by `0 14 * * *` (9am US Eastern / 14:00 UTC). Since v0.7.1 this same daily fire also runs the monthly payout digest when it's the 1st of the month (UTC) — the digest's separate `0 12 1 * *` trigger was removed to free one of the account's 5 free-plan cron slots. Single-user (Path B) implementation: reads `OWNER_UID`'s portfolio from Firestore via service account, fetches fresh dividend dates from Finnhub for each ticker with shares set, and sends a single rolled-up email via Resend if there's anything in the user's reminder window. Deduplicates with `prefs.notifiedReminders` (60-day auto-prune, 200 cap) so the same ex/pay-date never fires twice.
 
 Required Worker secrets/vars (in addition to the SnapTrade ones):
 - `FIREBASE_SERVICE_ACCOUNT_JSON` (secret) — full service account JSON pasted via `wrangler secret put`

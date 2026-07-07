@@ -11,15 +11,16 @@ compatibility_flags = ["nodejs_compat"]
 # profile helper) before `npx wrangler deploy`.
 account_id = "fe16eca597b8d5afa20dfe7b2550640b"
 
-# Two cron triggers:
+# One cron trigger:
 #   "0 14 * * *"   — Daily dividend reminders at 14:00 UTC (9am US Eastern,
 #                    10am during EDT). Same since worker v0.3.0.
-#   "0 12 1 * *"   — Monthly digest of upcoming payouts, on the 1st of each
-#                    month at 12:00 UTC (7am US Eastern, 8am during EDT).
-#                    Added in worker v0.7.0. The scheduled() handler in
-#                    src/index.js dispatches by event.cron.
+# v0.7.1: the former second trigger ("0 12 1 * *", monthly digest) was folded
+# into the daily one to free a cron slot for spyglass-worker — free CF
+# accounts allow 5 triggers account-wide. scheduled() in src/index.js runs
+# the monthly digest on the daily fire when it's the 1st (UTC), so the
+# digest now sends at 14:00 UTC on the 1st instead of 12:00.
 [triggers]
-crons = ["0 14 * * *", "0 12 1 * *"]
+crons = ["0 14 * * *"]
 
 # Firebase project ID is not a secret — it's already in the public stocks index.html
 # Used by the Worker to verify Firebase ID tokens issued to your users.
